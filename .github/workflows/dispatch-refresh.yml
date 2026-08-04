@@ -1,0 +1,129 @@
+name: dispatch-refresh
+
+# Issue-ops bridge: an issue titled `refresh` (opened by ANY GitHub account — this repo is public
+# precisely so that the trigger is unprivileged) dispatches the PRIVATE fire-analytics repo's
+# refresh.yml, then watches the run to completion and reports back on the issue.
+#
+# TRUST MODEL: the only credential is REFRESH_DISPATCH_TOKEN, a fine-grained PAT scoped to ONLY
+# 0xcasuwu/fire-analytics with ONLY "Actions: read & write", stored as an Actions secret HERE.
+# It never reaches a browser (the predecessor design encrypted a PAT into the static site itself —
+# password holders could recover it, and its expiry broke the button with an opaque error,
+# 2026-08-04). Worst case if this repo's automation is abused: rate-limited refresh runs of a
+# pipeline whose invariant gate decides what publishes — no data write access anywhere.
+#
+# ABUSE BOUNDS: `concurrency` serializes dispatch jobs; the guard step skips when a refresh is
+# already queued/running or finished <45 min ago, so issue spam degrades to one comment + close
+# per issue on this repo's FREE public-repo minutes — the private repo's paid minutes are only
+# spent when a real refresh is due. Issues with other titles are ignored entirely.
+#
+# STATUS PROTOCOL (consumed by the site's RefreshButton polling this repo's PUBLIC issues API —
+# keep label names in sync with components/RefreshButton.tsx in the private repo):
+#   refresh:running  dispatched, pipeline in progress
+#   refresh:done     pipeline completed green (site data advanced — reload)
+#   refresh:failed   pipeline red (usually the invariant gate refusing bad upstream data) OR
+#                    dispatch itself rejected (comment says which; maintainer action inside)
+#   refresh:skipped  nothing dispatched — a refresh was already running or recent
+# Labels are pre-created by setup (gh label create) — `gh issue edit --add-label` does NOT
+# create missing labels, it fails.
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+
+concurrency:
+  group: dispatch-refresh
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    # startsWith is case-insensitive in Actions expressions, so `Refresh`/`REFRESH` count too.
+    if: startsWith(github.event.issue.title, 'refresh')
+    runs-on: ubuntu-latest
+    # Watch phase is bounded at ~40 min below; this cap only backstops a hung runner.
+    timeout-minutes: 50
+    env:
+      GH_TOKEN: ${{ github.token }}                       # issue ops on THIS repo only
+      PAT: ${{ secrets.REFRESH_DISPATCH_TOKEN }}          # target-repo Actions, never logged
+      TARGET: 0xcasuwu/fire-analytics
+      WORKFLOW: refresh.yml
+      ISSUE: ${{ github.event.issue.number }}
+      RECENT_MIN: '45'
+    steps:
+      - name: Guard, dispatch, watch, report
+        run: |
+          set -euo pipefail
+          say()    { gh issue comment "$ISSUE" -R "$GITHUB_REPOSITORY" -b "$1" >/dev/null; }
+          mark()   { gh issue edit "$ISSUE" -R "$GITHUB_REPOSITORY" --add-label "$1" >/dev/null; }
+          unmark() { gh issue edit "$ISSUE" -R "$GITHUB_REPOSITORY" --remove-label "$1" >/dev/null || true; }
+          done_()  { gh issue close "$ISSUE" -R "$GITHUB_REPOSITORY" >/dev/null; }
+          api()    { curl -sS -H "Authorization: Bearer $PAT" -H "Accept: application/vnd.github+json" "$@"; }
+
+          if [ -z "$PAT" ]; then
+            mark refresh:failed
+            say "❌ Cannot dispatch: the \`REFRESH_DISPATCH_TOKEN\` secret is not configured in this repo. Maintainer: issue a fine-grained PAT (only \`$TARGET\`, only Actions read & write) and \`gh secret set REFRESH_DISPATCH_TOKEN\`."
+            done_; exit 0
+          fi
+
+          # ---- guard: skip if a refresh is already running or finished recently ----
+          RUNS_URL="https://api.github.com/repos/$TARGET/actions/workflows/$WORKFLOW/runs"
+          LATEST=$(api "$RUNS_URL?per_page=1")
+          STATUS=$(echo "$LATEST" | jq -r '.workflow_runs[0].status // "none"')
+          CREATED=$(echo "$LATEST" | jq -r '.workflow_runs[0].created_at // empty')
+          if [ "$STATUS" = "queued" ] || [ "$STATUS" = "in_progress" ]; then
+            mark refresh:skipped
+            say "⏳ A refresh is already ${STATUS/in_progress/running} — this request is folded into it. The site updates when it completes (~15–22 min from its start)."
+            done_; exit 0
+          fi
+          if [ -n "$CREATED" ]; then
+            AGE_MIN=$(( ( $(date -u +%s) - $(date -u -d "$CREATED" +%s) ) / 60 ))
+            if [ "$AGE_MIN" -lt "$RECENT_MIN" ]; then
+              mark refresh:skipped
+              say "🕐 The last refresh started only ${AGE_MIN} min ago (limit: one per ${RECENT_MIN} min), so the data is already at most that old — skipping. Try again later if the site still looks stale."
+              done_; exit 0
+            fi
+          fi
+
+          # ---- dispatch (force=true bypasses the tip-advanced skip, NOT the invariant gate) ----
+          MARK=$(date -u +%s)
+          CODE=$(curl -sS -o /tmp/dispatch-err -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $PAT" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$TARGET/actions/workflows/$WORKFLOW/dispatches" \
+            -d '{"ref":"main","inputs":{"force":"true"}}')
+          if [ "$CODE" != "204" ]; then
+            mark refresh:failed
+            say "❌ GitHub rejected the dispatch (HTTP $CODE). If 401/404, the \`REFRESH_DISPATCH_TOKEN\` PAT has expired or was revoked — maintainer: re-issue it (only \`$TARGET\`, only Actions read & write) and update the secret."
+            done_; exit 0
+          fi
+          mark refresh:running
+          say "🚀 Refresh dispatched — the pipeline re-reads the chain, proves the data against its invariant suite, and publishes only if everything passes (~15–22 min). This issue will be updated with the outcome."
+
+          # ---- watch: find the run we created, poll to completion (free public-repo minutes) ----
+          sleep 25
+          RUN_ID=$(api "$RUNS_URL?event=workflow_dispatch&per_page=5" | \
+            jq -r --argjson m "$MARK" '[.workflow_runs[] | select((.created_at | fromdateiso8601) >= ($m - 30))][0].id // empty')
+          CONCLUSION=""
+          if [ -n "$RUN_ID" ]; then
+            for i in $(seq 1 80); do   # 80 × 30s = 40 min bound
+              sleep 30
+              R=$(api "https://api.github.com/repos/$TARGET/actions/runs/$RUN_ID")
+              if [ "$(echo "$R" | jq -r .status)" = "completed" ]; then
+                CONCLUSION=$(echo "$R" | jq -r .conclusion); break
+              fi
+            done
+          fi
+          unmark refresh:running
+          case "$CONCLUSION" in
+            success)
+              mark refresh:done
+              say "✅ Refresh complete — reload the site to unlock the new snapshot. (A green run can still mean *skipped* if a third-party upstream was down; the block height in the site header is the ground truth.)";;
+            "")
+              mark refresh:failed
+              say "⚠️ Lost track of the run (it did dispatch, but didn't finish within the 40-minute watch window). Check the site's header badge in a few minutes.";;
+            *)
+              mark refresh:failed
+              say "❌ The refresh ran and FAILED its invariant gate, so nothing was published and the site keeps the last proven snapshot. This is the pipeline refusing inconsistent upstream data — a maintainer needs to look at the failing invariants, more refresh requests will not help.";;
+          esac
+          done_
