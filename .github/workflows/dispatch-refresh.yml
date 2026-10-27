@@ -42,8 +42,14 @@ jobs:
     # startsWith is case-insensitive in Actions expressions, so `Refresh`/`REFRESH` count too.
     if: startsWith(github.event.issue.title, 'refresh')
     runs-on: ubuntu-latest
-    # Watch phase is bounded at ~40 min below; this cap only backstops a hung runner.
-    timeout-minutes: 50
+    # Watch phase is bounded at 110 min below — LONGER than refresh.yml's own 90-min job cap, so a
+    # dispatched run always reaches a real conclusion before we stop looking. This cap only
+    # backstops a hung runner. (Public-repo minutes are free; watching longer costs nothing.)
+    # 2026-10-27: the window used to be 40 min. On 10-26 espo degraded and refreshes ran 73-105 min
+    # (all green in the end), so issue #56 was told "Lost track of the run" and labelled
+    # refresh:failed while its run was still on its way to publishing. A watcher shorter than the
+    # thing it watches reports failure for success.
+    timeout-minutes: 120
     env:
       GH_TOKEN: ${{ github.token }}                       # issue ops on THIS repo only
       PAT: ${{ secrets.REFRESH_DISPATCH_TOKEN }}          # target-repo Actions, never logged
@@ -59,7 +65,8 @@ jobs:
           mark()   { gh issue edit "$ISSUE" -R "$GITHUB_REPOSITORY" --add-label "$1" >/dev/null; }
           unmark() { gh issue edit "$ISSUE" -R "$GITHUB_REPOSITORY" --remove-label "$1" >/dev/null || true; }
           done_()  { gh issue close "$ISSUE" -R "$GITHUB_REPOSITORY" >/dev/null; }
-          api()    { curl -sS -H "Authorization: Bearer $PAT" -H "Accept: application/vnd.github+json" "$@"; }
+          # Target-repo calls go through `gh api` with the PAT (no curl in CI, operator rule 2026-10-25).
+          api()    { GH_TOKEN="$PAT" gh api -H "Accept: application/vnd.github+json" "$@"; }
 
           if [ -z "$PAT" ]; then
             mark refresh:failed
@@ -68,13 +75,13 @@ jobs:
           fi
 
           # ---- guard: skip if a refresh is already running or finished recently ----
-          RUNS_URL="https://api.github.com/repos/$TARGET/actions/workflows/$WORKFLOW/runs"
+          RUNS_URL="repos/$TARGET/actions/workflows/$WORKFLOW/runs"
           LATEST=$(api "$RUNS_URL?per_page=1")
           STATUS=$(echo "$LATEST" | jq -r '.workflow_runs[0].status // "none"')
           CREATED=$(echo "$LATEST" | jq -r '.workflow_runs[0].created_at // empty')
           if [ "$STATUS" = "queued" ] || [ "$STATUS" = "in_progress" ]; then
             mark refresh:skipped
-            say "⏳ A refresh is already ${STATUS/in_progress/running} — this request is folded into it. The site updates when it completes (~15–22 min from its start)."
+            say "⏳ A refresh is already ${STATUS/in_progress/running} — this request is folded into it. The site updates when it completes (usually ~15–30 min from its start)."
             done_; exit 0
           fi
           if [ -n "$CREATED" ]; then
@@ -88,27 +95,33 @@ jobs:
 
           # ---- dispatch (force=true bypasses the tip-advanced skip, NOT the invariant gate) ----
           MARK=$(date -u +%s)
-          CODE=$(curl -sS -o /tmp/dispatch-err -w '%{http_code}' -X POST \
-            -H "Authorization: Bearer $PAT" -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$TARGET/actions/workflows/$WORKFLOW/dispatches" \
-            -d '{"ref":"main","inputs":{"force":"true"}}')
-          if [ "$CODE" != "204" ]; then
+          if ! ERR=$(api -X POST "repos/$TARGET/actions/workflows/$WORKFLOW/dispatches" \
+                -f ref=main -f 'inputs[force]=true' 2>&1); then
+            CODE=$(echo "$ERR" | grep -o 'HTTP [0-9]*' | head -1 | cut -d' ' -f2); CODE=${CODE:-?}
             mark refresh:failed
             say "❌ GitHub rejected the dispatch (HTTP $CODE). If 401/404, the \`REFRESH_DISPATCH_TOKEN\` PAT has expired or was revoked — maintainer: re-issue it (only \`$TARGET\`, only Actions read & write) and update the secret."
             done_; exit 0
           fi
           mark refresh:running
-          say "🚀 Refresh dispatched — the pipeline re-reads the chain, proves the data against its invariant suite, and publishes only if everything passes (~15–22 min). This issue will be updated with the outcome."
+          say "🚀 Refresh dispatched — the pipeline re-reads the chain, proves the data against its invariant suite, and publishes only if everything passes (usually ~15–30 min; up to 90 when an upstream indexer is slow). This issue will be updated with the outcome."
 
           # ---- watch: find the run we created, poll to completion (free public-repo minutes) ----
           sleep 25
-          RUN_ID=$(api "$RUNS_URL?event=workflow_dispatch&per_page=5" | \
-            jq -r --argjson m "$MARK" '[.workflow_runs[] | select((.created_at | fromdateiso8601) >= ($m - 30))][0].id // empty')
+          # Retried: under `set -e` one API blip here used to end the job with the issue stuck on
+          # refresh:running. The run can also take a few seconds to appear after the 204.
+          RUN_ID=""
+          for i in 1 2 3 4 5 6; do
+            RUN_ID=$(api "$RUNS_URL?event=workflow_dispatch&per_page=5" | \
+              jq -r --argjson m "$MARK" '[.workflow_runs[] | select((.created_at | fromdateiso8601) >= ($m - 30))][0].id // empty') || RUN_ID=""
+            [ -n "$RUN_ID" ] && break
+            sleep 10
+          done
           CONCLUSION=""
           if [ -n "$RUN_ID" ]; then
-            for i in $(seq 1 80); do   # 80 × 30s = 40 min bound
+            for i in $(seq 1 220); do   # 220 × 30s = 110 min bound (> refresh.yml's 90-min job cap)
               sleep 30
-              R=$(api "https://api.github.com/repos/$TARGET/actions/runs/$RUN_ID")
+              # A transient API error is not a verdict — keep watching.
+              R=$(api "repos/$TARGET/actions/runs/$RUN_ID") || continue
               if [ "$(echo "$R" | jq -r .status)" = "completed" ]; then
                 CONCLUSION=$(echo "$R" | jq -r .conclusion); break
               fi
@@ -121,7 +134,7 @@ jobs:
               say "✅ Refresh complete — reload the site to unlock the new snapshot. (A green run can still mean *skipped* if a third-party upstream was down; the block height in the site header is the ground truth.)";;
             "")
               mark refresh:failed
-              say "⚠️ Lost track of the run (it did dispatch, but didn't finish within the 40-minute watch window). Check the site's header badge in a few minutes.";;
+              say "⚠️ Lost track of the run: it dispatched, but ${RUN_ID:+run $RUN_ID }had not finished after 110 minutes, longer than the pipeline's own 90-minute limit. This should not happen; a maintainer should look at the refresh workflow. The site keeps its last proven snapshot; check the block height in its header.";;
             *)
               mark refresh:failed
               say "❌ The refresh ran and FAILED its invariant gate, so nothing was published and the site keeps the last proven snapshot. This is the pipeline refusing inconsistent upstream data — a maintainer needs to look at the failing invariants, more refresh requests will not help.";;
